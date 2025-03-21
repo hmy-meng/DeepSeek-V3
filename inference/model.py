@@ -411,8 +411,6 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 # 这个 MLA 类实现了带有低秩适应（LoRA）和旋转位置编码（RoPE）的多头注意力机制（Multi-Head Attention）。
 # 具体来说：
 
-
-
 # 低秩适应（LoRA）: 通过引入低秩矩阵来减少模型参数数量，提高模型的可训练性和效率。
 # 旋转位置编码（RoPE）: 通过旋转位置编码来捕捉序列中的相对位置信息，增强模型对长距离依赖关系的理解。
 # 多头注意力机制: 通过多个独立的注意力头来捕捉不同子空间的信息，提高模型的表达能力。
@@ -458,7 +456,6 @@ class MLA(nn.Module):
             self.q_norm = RMSNorm(self.q_lora_rank)
             # Q 初始化升维矩阵
             self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)   # 1536 -> 128*192=24576
-        
  
         # KV 联合降维矩阵 shape=(7168, 512+64=576)
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
