@@ -97,9 +97,15 @@ class ParallelEmbedding(nn.Module):
         self.vocab_size = vocab_size
         self.dim = dim
         assert vocab_size % world_size == 0, f"Vocabulary size must be divisible by world size (world_size={world_size})"
+        
+        # 计算每个设备上的词汇表部分大小
         self.part_vocab_size = (vocab_size // world_size)
+
+        # 确定当前设备负责的词汇表起始和结束索引
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
+        
+        # 初始化当前设备上的嵌入权重
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -115,13 +121,20 @@ class ParallelEmbedding(nn.Module):
         Raises:
             ValueError: If `world_size` is not defined.
         """
+        # 如果在分布式环境中（即world_size > 1）
         if world_size > 1:
+            # 创建一个掩码，用于标记不在当前设备词汇表范围内的索引
             mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
+            # 将输入索引调整为当前设备词汇表的局部索引
             x = x - self.vocab_start_idx
+            # 将超出当前设备词汇表范围的索引置为0（这些索引将不会参与嵌入查找）
             x[mask] = 0
+        # 使用调整后的索引和当前设备的嵌入权重进行嵌入查找
         y = F.embedding(x, self.weight)
         if world_size > 1:
+            # 将超出当前设备词汇表范围的嵌入结果置为0（这些位置将接收来自其他设备的值）
             y[mask] = 0
+            # 注意：这里假设已经正确设置了分布式通信后端和组
             dist.all_reduce(y)
         return y
 
@@ -148,12 +161,15 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
         - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
         - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
     """
+    # 如果权重的元素大小大于1（即未量化或使用标准浮点类型），则直接使用PyTorch的线性变换函数
     if weight.element_size() > 1:
         return F.linear(x, weight, bias)
+    # 对权重进行反量化（如果之前被量化）
     elif gemm_impl == "bf16":
         weight = weight_dequant(weight, weight.scale)
         return F.linear(x, weight, bias)
     else:
+        # 对输入x进行量化，并获取量化比例scale
         x, scale = act_quant(x, block_size)
         y = fp8_gemm(x, scale, weight, weight.scale)
         if bias is not None:
@@ -171,12 +187,14 @@ class Linear(nn.Module):
         bias (bool): Whether to include a bias term. Defaults to False.
         dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
     """
+    # 设置默认的权重数据类型为 bfloat16
     dtype = torch.bfloat16
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        # 初始化权重，如果未指定 dtype，则使用类的默认 dtype（bfloat16）
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
         if self.weight.element_size() == 1:
             scale_out_features = (out_features + block_size - 1) // block_size
@@ -201,7 +219,7 @@ class Linear(nn.Module):
         """
         return linear(x, self.weight, self.bias)
 
-
+# 继承自Linear 类, 类是一个线性层的并行实现，它将输出特征分割成多个部分，每个部分在不同的设备上计算。这通常用于分布式训练，以加速线性层的计算。
 class ColumnParallelLinear(Linear):
     """
     Linear layer with column parallelism, splitting output features across distributed processes.
@@ -230,7 +248,7 @@ class ColumnParallelLinear(Linear):
         y = linear(x, self.weight, self.bias)
         return y
 
-
+# 继承自Linear 类, 类是一个线性层的并行实现，它将输出特征分割成多个部分，每个部分在不同的设备上计算。这通常用于分布式训练，以加速线性层的计算。
 class RowParallelLinear(Linear):
     """
     Linear layer with row parallelism, splitting input features across distributed processes.
@@ -390,12 +408,23 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return y.to(dtype)
 
 
+# 这个 MLA 类实现了带有低秩适应（LoRA）和旋转位置编码（RoPE）的多头注意力机制（Multi-Head Attention）。
+# 具体来说：
+
+
+
+# 低秩适应（LoRA）: 通过引入低秩矩阵来减少模型参数数量，提高模型的可训练性和效率。
+# 旋转位置编码（RoPE）: 通过旋转位置编码来捕捉序列中的相对位置信息，增强模型对长距离依赖关系的理解。
+# 多头注意力机制: 通过多个独立的注意力头来捕捉不同子空间的信息，提高模型的表达能力。
+# 分布式支持: 通过 world_size 和 rank 参数支持多进程分布式训练，确保每个进程只负责一部分头，提高了并行计算能力。
+# 缓存机制: 使用缓存存储键和值，加速推理过程，特别是在生成任务中。
+# 通过这种方式，MLA 能够在大规模机器学习任务中高效地处理复杂的序列数据，提高模型的性能和泛化能力。
 class MLA(nn.Module):
     """
     Multi-Headed Attention Layer (MLA).
 
     Attributes:
-        dim (int): Dimensionality of the input features.
+        dim (int): Dimensionality of the input features.   
         n_heads (int): Number of attention heads.
         n_local_heads (int): Number of local attention heads for distributed systems.
         q_lora_rank (int): Rank for low-rank query projection.
@@ -408,35 +437,49 @@ class MLA(nn.Module):
     """
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.dim = args.dim
-        self.n_heads = args.n_heads
-        self.n_local_heads = args.n_heads // world_size
-        self.q_lora_rank = args.q_lora_rank
-        self.kv_lora_rank = args.kv_lora_rank
-        self.qk_nope_head_dim = args.qk_nope_head_dim
-        self.qk_rope_head_dim = args.qk_rope_head_dim
-        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
-        self.v_head_dim = args.v_head_dim
+        self.dim = args.dim  # 输入数据的维度   7168
+        self.n_heads = args.n_heads  # 头的数量  128
+        self.n_local_heads = args.n_heads // world_size  # 每个进程本地的头数量
+        self.q_lora_rank = args.q_lora_rank  # 查询向量的LoRA秩   1536
+        self.kv_lora_rank = args.kv_lora_rank  # 键值对向量的LoRA秩  512
+        self.qk_nope_head_dim = args.qk_nope_head_dim  # 查询和键值对中不含位置编码的部分维度  128
+        self.qk_rope_head_dim = args.qk_rope_head_dim  # 查询和键值对中含有旋转位置编码的部分维度  64
+        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim  # 查询和键值对的总维度  192 = 128 + 64
+        self.v_head_dim = args.v_head_dim  # 值向量的维度  128
 
-        if self.q_lora_rank == 0:
+        # 定义查询向量的线性变换层
+        if self.q_lora_rank == 0:  # 不使用 LoRA 进行线性变换
+            # 直接进行线性变换
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
-        else:
-            self.wq_a = Linear(self.dim, self.q_lora_rank)
+        else:  # 使用 LoRA 进行线性变换(降维)
+            # Q 初始化降维矩阵
+            self.wq_a = Linear(self.dim, self.q_lora_rank)  # 7168->1536
+             # 初始化查询投影的归一化层
             self.q_norm = RMSNorm(self.q_lora_rank)
-            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+            # Q 初始化升维矩阵
+            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)   # 1536 -> 128*192=24576
+        
+ 
+        # KV 联合降维矩阵 shape=(7168, 512+64=576)
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
-        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
+        # QK 矩阵吸收
+        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))  # 512,128*(128+128)
+        
+        # 定义输出线性变换层 [128*128,7168]
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        
+        # 计算softmax缩放因子
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        if attn_impl == "naive":
+        # 注册缓存缓冲区
+        if attn_impl == "naive":  # naive 实现方式
             self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
             self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
-        else:
+        else:  # absorb 实现方式
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
@@ -455,41 +498,85 @@ class MLA(nn.Module):
         """
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
-        if self.q_lora_rank == 0:
-            q = self.wq(x)
+        # 1、计算查询向量 q
+        if self.q_lora_rank == 0:  # 不使用 LoRA 进行线性变换
+            q = self.wq(x)  # 直接进行线性变换
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+            q = self.wq_b(self.q_norm(self.wq_a(x)))  # 使用 LoRA 进行线性变换
+
+        # 将查询向量 q 重塑为 (batch_size, sequence_length, local_heads, head_dimension)
+        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim) # b,s,128,192
+        
+        # 2、拆分不含位置编码和含有旋转位置编码 Q
+        # (b, s, 128, 192) => (b, s, 128, 128)|(b, s, 128, 64)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        
+        # 应用旋转位置编码到 q_pe
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = self.wkv_a(x)
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
+        # 3、计算 KV 向量  wkv_a : (7168, 512+64=576)
+        kv = self.wkv_a(x)  # (b,s,7168) => (b,s,512+64=576) 
+        
+        # 4、拆分键值对向量中的键值部分和旋转位置编码部分
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) # (b,s,576) => (b,s,512) 和 (b,s,64)
+        
+        # (2,1,1,64)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-        if attn_impl == "naive":
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
+        
+        # 根据不同的注意力实现方式处理键值对向量
+        if attn_impl == "naive":  # naive 实现方式
+            q = torch.cat([q_nope, q_pe], dim=-1)  # 合并查询向量的不同部分
+            kv = self.wkv_b(self.kv_norm(kv))  # 对键值对向量进行线性变换
+            
+            # 重塑键值对向量
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            
+            # 分离键值对向量中的键和值部分
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            
+            # 合并键的不同部分
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            
+            # 更新键和值的缓存
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
+            
+            # 计算注意力分数
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
-        else:
+        else:   # 5、absorb 实现方式
+            # wkv_b : 512,128*(128+128)
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)   # (128*(128+128)=32768, 512) => (128, 256, 512)
+            
+            # 对查询向量的没有 ROPE 的部分进行线性变换
+            # q_nope:[b, s, 128, 128], wkv_b:[128, 256, 512], wkv_b[:, :self.qk_nope_head_dim]:[128,128,512]->[b,s,128,512]
+            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])   # (b,s,128,128) einsum (128,128,512) => (b,s,128,512)
+            
+            # self.kv_cache预设一个大一点的全零张量(8,16384,512)缓存 kv
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
+
+            # # self.pe_cache预设一个大一点的全零张量(8,16384,64) 缓存 pe
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            
+            # 计算注意力分数
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+        
+        # 应用掩码（如果有）
         if mask is not None:
             scores += mask.unsqueeze(1)
+        
+        # 计算注意力权重
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+        
+        # 计算加权求和结果
         if attn_impl == "naive":
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
         else:
-            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])  # scores:[bs, seq, 128, kv_len]  kv_cache:[bs , kv_len, 512] -> [b,s,128,512]
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])  #  (b,s,128,512) (128,-128:,512) -> (2,1,128,128)
+        
+        # 最终线性变换
         x = self.wo(x.flatten(2))
         return x
 
@@ -551,12 +638,15 @@ class Gate(nn.Module):
             args (ModelArgs): Model arguments containing gating parameters.
         """
         super().__init__()
+        # 初始化参数
         self.dim = args.dim
         self.topk = args.n_activated_experts
         self.n_groups = args.n_expert_groups
         self.topk_groups = args.n_limited_groups
         self.score_func = args.score_func
         self.route_scale = args.route_scale
+
+        # 定义权重参数
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
 
@@ -570,28 +660,56 @@ class Gate(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        scores = linear(x, self.weight)
+        # 计算初始得分
+        scores = linear(x, self.weight)  # 线性变换
+
+        # 应用分数计算函数
         if self.score_func == "softmax":
-            scores = scores.softmax(dim=-1, dtype=torch.float32)
+            scores = scores.softmax(dim=-1, dtype=torch.float32)    # 使用softmax函数
         else:
-            scores = scores.sigmoid()
+            scores = scores.sigmoid()  # 使用sigmoid函数
+        
+        # 保存原始得分以便后续使用
         original_scores = scores
+
+        # 添加偏置（如果存在）
         if self.bias is not None:
             scores = scores + self.bias
+
+        # 处理分组情况
         if self.n_groups > 1:
+            # 将得分重塑为 (batch_size, n_groups, experts_per_group)
             scores = scores.view(x.size(0), self.n_groups, -1)
+
+            # 计算每组的最大得分或前两个最大得分之和
             if self.bias is None:
-                group_scores = scores.amax(dim=-1)
+                group_scores = scores.amax(dim=-1)  # 取每组的最大得分
             else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)  # 取每组的前两个最大得分
+            
+            # 选择得分最高的topk_groups组
+            indices = group_scores.topk(self.topk_groups, dim=-1)[1]  # 对前两个最大得分求和
+            
+            # 创建掩码以保留选中的组
             mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
+            
+            # 应用掩码过滤得分
             scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+        
+        # 选择得分最高的topk专家
         indices = torch.topk(scores, self.topk, dim=-1)[1]
+        
+        # 根据索引从原始得分中提取对应的权重
         weights = original_scores.gather(1, indices)
+        
+        # 归一化权重（如果使用sigmoid函数）
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
+
+        # 缩放权重
         weights *= self.route_scale
+
+        # 返回权重和索引
         return weights.type_as(x), indices
 
 
@@ -629,6 +747,15 @@ class Expert(nn.Module):
         """
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+
+
+# 这个 MoE 类实现了混合专家网络（Mixture of Experts）的一部分功能，主要用于在大规模分布式训练环境中提高模型的效率和性能。
+# 具体来说：
+# 高效性: 通过稀疏激活机制，只有一小部分专家会被激活来处理每个输入样本的数据，从而减少了计算负担。
+# 并行性: 支持多进程分布式训练，确保每个进程只负责一部分专家，提高了并行计算能力。
+# 扩展性: 适用于大型神经网络模型，如Transformer模型，能够有效处理大量数据和复杂模式。
+# 灵活性: 结合专用专家和共享专家，既捕捉特定特征又保持一定的通用性。
+# 通过这种方式，MoE 能够显著提高模型的表达能力和计算效率，在大规模机器学习任务中表现出色。
 
 class MoE(nn.Module):
     """
@@ -690,6 +817,7 @@ class MoE(nn.Module):
         return (y + z).view(shape)
 
 
+# 定义一个基于nn.Module的类Block，通常用于构建神经网络中的一层或一组特定功能的层。
 class Block(nn.Module):
     """
     Transformer block combining attention and feed-forward layers.
@@ -710,7 +838,12 @@ class Block(nn.Module):
         """
         super().__init__()
         self.attn = MLA(args)
+        # 根据layer_id决定是使用前馈神经网络（MLP）还是混合专家模型（MoE）。
+        # 如果当前层ID小于args.n_dense_layers，则使用MLP；否则使用MoE。
+        # MLP通常用于处理特征映射，而MoE用于提高模型的容量和泛化能力。
         self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
+        
+        # 为注意力机制模块和前馈网络模块分别创建RMSNorm归一化层。RMSNorm是一种归一化方法，常用于稳定训练过程。
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
 
@@ -727,7 +860,10 @@ class Block(nn.Module):
         Returns:
             torch.Tensor: Output tensor after block computation.
         """
+
+        # 对输入x应用注意力机制模块，首先对x进行归一化，然后将结果加上原始输入x（残差连接）。
         x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
+        # 对注意力机制模块的输出再次应用归一化，并通过前馈网络模块（MLP或MoE），然后将结果加上输入（残差连接）。
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
